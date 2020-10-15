@@ -7,6 +7,8 @@ use crate::rcc::Rcc;
 use crate::stm32::{I2C1, I2C2};
 use crate::time::Hertz;
 use core::cmp;
+use core::marker::PhantomData;
+use cortex_m::asm;
 
 pub struct Config {
     speed: Option<Hertz>,
@@ -73,10 +75,11 @@ impl Config {
 }
 
 /// I2C abstraction
-pub struct I2c<I2C, SDA, SCL> {
+pub struct I2c<I2C, SDA, SCL, Mode> {
     i2c: I2C,
     sda: SDA,
     scl: SCL,
+    _mode: PhantomData<Mode>,
 }
 
 // I2C SDA pin
@@ -99,8 +102,41 @@ pub enum Error {
     ArbitrationLost,
 }
 
+// I2C bus modes
+
+/// The type of an I2C peripheral that has been created
+/// but not yet assigned as a master or slave.
+pub struct BusNone;
+
+// The type of an I2C peripheral that has been assigned
+// as a bus master.
+pub struct BusMaster;
+
+// The type of an I2C peripheral that has been assigned
+// as a bus slave.
+pub struct BusSlave;
+
 pub trait I2cExt<I2C> {
-    fn i2c<SDA, SCL>(self, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> I2c<I2C, SDA, SCL>
+    fn i2c_master<SDA, SCL>(
+        self,
+        sda: SDA,
+        scl: SCL,
+        config: Config,
+        rcc: &mut Rcc,
+    ) -> I2c<I2C, SDA, SCL, BusMaster>
+    where
+        SDA: SDAPin<I2C>,
+        SCL: SCLPin<I2C>;
+
+    /// Creates a new I2C object in slave mode.
+    fn i2c_slave<SDA, SCL>(
+        self,
+        sda: SDA,
+        scl: SCL,
+        config: Config,
+        addr: u8,
+        rcc: &mut Rcc,
+    ) -> I2c<I2C, SDA, SCL, BusSlave>
     where
         SDA: SDAPin<I2C>,
         SCL: SCLPin<I2C>;
@@ -167,22 +203,39 @@ macro_rules! i2c {
         )+
 
         impl I2cExt<$I2CX> for $I2CX {
-            fn i2c<SDA, SCL>(
+            fn i2c_master<SDA, SCL>(
                 self,
                 sda: SDA,
                 scl: SCL,
                 config: Config,
                 rcc: &mut Rcc,
-            ) -> I2c<$I2CX, SDA, SCL>
+            ) -> I2c<$I2CX, SDA, SCL, BusMaster>
             where
                 SDA: SDAPin<$I2CX>,
                 SCL: SCLPin<$I2CX>,
             {
-                I2c::$i2cx(self, sda, scl, config, rcc)
+                I2c::$i2cx(self, sda, scl, config, rcc).into_master()
+            }
+
+
+            /// Creates a new I2C object in slave mode.
+            fn i2c_slave<SDA, SCL>(
+                self,
+                sda: SDA,
+                scl: SCL,
+                config: Config,
+                addr: u8,
+                rcc: &mut Rcc,
+            ) -> I2c<$I2CX, SDA, SCL, BusSlave>
+            where
+                SDA: SDAPin<$I2CX>,
+                SCL: SCLPin<$I2CX>,
+            {
+                I2c::$i2cx(self, sda, scl, config, rcc).into_slave(addr)
             }
         }
 
-        impl<SDA, SCL> I2c<$I2CX, SDA, SCL> {
+        impl<SDA, SCL> I2c<$I2CX, SDA, SCL, BusNone> {
             pub fn $i2cx(i2c: $I2CX, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> Self
             where
                 SDA: SDAPin<$I2CX>,
@@ -216,7 +269,101 @@ macro_rules! i2c {
                         .bit(!config.analog_filter)
                 });
 
-                I2c { i2c, sda, scl }
+                I2c { i2c, sda, scl, _mode: PhantomData }
+            }
+        }
+
+        impl<SDA, SCL, Mode> I2c<$I2CX, SDA, SCL, Mode> {
+            pub fn into_master(self) -> I2c<$I2CX, SDA, SCL, BusMaster> {
+                let (i2c, sda, scl) = self.release();
+
+                // Reset the bus, bringing it up in master mode
+                // (sets the TXE (Transmit data register empty) interrupt bit)
+                i2c.cr1.modify(|_, w| w.pe().clear_bit());
+                while i2c.cr1.read().pe().bit_is_set() {
+                    asm::nop();
+                } // wait for disabled
+
+                // Disable slave settings: clock stretch, slave byte control
+                i2c.cr1.modify(|_, w| {
+                    w.nostretch().set_bit().sbc().clear_bit()
+                });
+
+                // Clear own address register
+                i2c.oar1.modify(|_, w| {
+                    w.oa1en()
+                        .clear_bit()
+                        .oa1mode()
+                        .clear_bit() // ensure we're in 7-bit mode
+                });
+
+                // Disable interrupts
+                i2c.cr1.modify(|_, w| {
+                    w.addrie()
+                        .clear_bit()
+                        .errie()
+                        .clear_bit()
+                        .stopie()
+                        .clear_bit()
+                        .nackie()
+                        .clear_bit()
+                        .tcie()
+                        .clear_bit()
+                });
+
+                // Re-enable bus
+                i2c.cr1.modify(|_, w| w.pe().set_bit());
+
+                I2c { i2c, sda, scl, _mode: PhantomData }
+            }
+
+            pub fn into_slave(self, addr: u8) -> I2c<$I2CX, SDA, SCL, BusSlave> {
+                let (i2c, sda, scl) = self.release();
+
+                // Reset the bus, bringing it up in slave mode
+                // (sets the TXE (Transmit data register empty) interrupt bit)
+                i2c.cr1.modify(|_, w| w.pe().clear_bit());
+                while i2c.cr1.read().pe().bit_is_set() {
+                    asm::nop();
+                } // wait for disabled
+
+                // Enable clock stretch with slave byte control
+                i2c.cr1
+                    .modify(|_, w| w.nostretch().clear_bit().sbc().set_bit());
+
+                // Re-enable bus
+                i2c.cr1.modify(|_, w| w.pe().set_bit());
+
+                // Set up slave mode: set own address
+                // In 7-bit addressing mode for I2C, the low bit of the address
+                // must not be set and the upper 7 bits of the u8 are used.
+                assert!(addr & 0x01 == 0);
+                i2c.oar1.modify(|_, w| unsafe {
+                    w.oa1en()
+                        .clear_bit()
+                        .oa1mode()
+                        .clear_bit() // ensure we're in 7-bit mode
+                        .oa1_7_1()
+                        .bits(addr)
+                        .oa1en()
+                        .set_bit()
+                });
+
+                // Enable interrupts
+                i2c.cr1.modify(|_, w| {
+                    w.addrie()
+                        .set_bit()
+                        .errie()
+                        .set_bit()
+                        .stopie()
+                        .set_bit()
+                        .nackie()
+                        .set_bit()
+                        .tcie()
+                        .set_bit()
+                });
+
+                I2c { i2c, sda, scl, _mode: PhantomData }
             }
 
             pub fn release(self) -> ($I2CX, SDA, SCL) {
@@ -224,7 +371,7 @@ macro_rules! i2c {
             }
         }
 
-        impl<SDA, SCL> WriteRead for I2c<$I2CX, SDA, SCL> {
+        impl<SDA, SCL> WriteRead for I2c<$I2CX, SDA, SCL, BusMaster> {
             type Error = Error;
 
             fn write_read(
@@ -302,7 +449,7 @@ macro_rules! i2c {
             }
         }
 
-        impl<SDA, SCL> Write for I2c<$I2CX, SDA, SCL> {
+        impl<SDA, SCL> Write for I2c<$I2CX, SDA, SCL, BusMaster> {
             type Error = Error;
 
             fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -337,7 +484,7 @@ macro_rules! i2c {
             }
         }
 
-        impl<SDA, SCL> Read for I2c<$I2CX, SDA, SCL> {
+        impl<SDA, SCL> Read for I2c<$I2CX, SDA, SCL, BusMaster> {
             type Error = Error;
 
             fn read(&mut self, addr: u8, bytes: &mut [u8]) -> Result<(), Self::Error> {
