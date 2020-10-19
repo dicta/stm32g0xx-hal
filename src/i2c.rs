@@ -100,6 +100,7 @@ pub enum Error {
     PECError,
     BusError,
     ArbitrationLost,
+    Timeout,
 }
 
 // I2C bus modes
@@ -170,6 +171,12 @@ macro_rules! busy_wait {
             } else if isr.arlo().bit_is_set() {
                 $i2c.icr.write(|w| w.arlocf().set_bit());
                 return Err(Error::ArbitrationLost);
+            } else if isr.ovr().bit_is_set() {
+                $i2c.icr.write(|w| w.ovrcf().set_bit());
+                return Err(Error::Overrun);
+            } else if isr.timeout().bit_is_set() {
+                $i2c.icr.write(|w| w.timoutcf().set_bit());
+                return Err(Error::Timeout);
             } else if isr.nackf().bit_is_set() {
                 $i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
                 flush_txdr!($i2c);
@@ -355,12 +362,6 @@ macro_rules! i2c {
                         .set_bit()
                         .errie()
                         .set_bit()
-                        .stopie()
-                        .set_bit()
-                        .nackie()
-                        .set_bit()
-                        .tcie()
-                        .set_bit()
                 });
 
                 I2c { i2c, sda, scl, _mode: PhantomData }
@@ -520,6 +521,144 @@ macro_rules! i2c {
                 }
 
                 // automatic STOP
+
+                Ok(())
+            }
+        }
+
+        impl<SDA, SCL> Write for I2c<$I2CX, SDA, SCL, BusSlave> {
+            type Error = Error;
+
+            /// Writes the specified bytes on the I2C bus (transmitting slave
+            /// to master receiver).
+            ///
+            /// This function is intended to be called from an interrupt handler
+            /// or polling listener that waits for the I2C peripheral to indicate
+            /// an address match. It will program the registers to transfer data
+            /// and then clear the address match bit itself: it is important
+            /// that the interrupt handler does not try to clear this bit before calling
+            /// this function, as there is some additional setup required while the
+            /// bus clock is being stretched.
+            fn write(&mut self, _addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+                assert!(bytes.len() < 256 && bytes.len() > 0);
+
+                self.i2c.cr2.modify(|_, w| unsafe {
+                    w
+                        // Start transfer
+                        .start().set_bit()
+                        // Set number of bytes to transfer
+                        .nbytes().bits(bytes.len() as u8)
+                        // do not use automatic end mode as a slave
+                        .autoend().clear_bit()
+                });
+
+                // Clear address acknowledge bit to signal peripheral to begin transfer
+                self.i2c.icr.write(|w| w.addrcf().set_bit());
+
+                for byte in bytes {
+                    // Wait until we are allowed to send data
+                    busy_wait!(self.i2c, txis, bit_is_set);
+
+                    // Put byte on the wire
+                    self.i2c.txdr.write(|w| unsafe { w.txdata().bits(*byte) });
+                }
+
+                // After a successful transaction, master will signal NACK,
+                // then START or STOP depending on if another transaction is pending.
+                // The I2C peripheral hardware will handle the START/STOP processing,
+                // so it remains up to us to check for NACK.
+                loop {
+                    let isr = self.i2c.isr.read();
+                    if isr.nackf().bit_is_set() || isr.stopf().bit_is_set() {
+                        // Expected case: a stop condition is set, we're done
+                        self.i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
+                        flush_txdr!(self.i2c); // Ensure flushed
+                        break;
+                    } else if isr.timeout().bit_is_set() {
+                        self.i2c.icr.write(|w| w.timoutcf().set_bit());
+                        return Err(Error::Timeout);
+                    } else if isr.berr().bit_is_set() {
+                        self.i2c.icr.write(|w| w.berrcf().set_bit());
+                        return Err(Error::BusError);
+                    } else if isr.arlo().bit_is_set() {
+                        self.i2c.icr.write(|w| w.arlocf().set_bit());
+                        return Err(Error::ArbitrationLost);
+                    } else {
+                        // try again
+                    }
+                }
+
+                Ok(())
+            }
+        }
+
+        /// Reads bytes from the I2C bus into the provided buffer (receiving slave
+        /// from master transmitter).
+        ///
+        /// This function is intended to be called from an interrupt handler
+        /// or polling listener that waits for the I2C peripheral to indicate
+        /// an address match. It will program the registers to transfer data
+        /// and then clear the address match bit itself: it is important
+        /// that the interrupt handler does not try to clear this bit before calling
+        /// this function, as there is some additional setup required while the
+        /// bus clock is being stretched.
+        impl<SDA, SCL> Read for I2c<$I2CX, SDA, SCL, BusSlave> {
+            type Error = Error;
+
+            fn read(&mut self, _addr: u8, bytes: &mut [u8]) -> Result<(), Self::Error> {
+                // TODO support transfers of more than 255 bytes
+                assert!(bytes.len() < 256 && bytes.len() > 0);
+
+                // Wait for any previous address sequence to end automatically.
+                // This could be up to 50% of a bus cycle (ie. up to 0.5/freq)
+                while self.i2c.cr2.read().start().bit_is_set() {};
+
+                // Set START and prepare to receive bytes into `buffer`.
+                // The START bit can be set even if the bus
+                // is BUSY or I2C is in slave mode.
+                self.i2c.cr2.modify(|_, w| unsafe {
+                    w
+                        // Start transfer
+                        .start().set_bit()
+                        // Set number of bytes to transfer
+                        .nbytes().bits(bytes.len() as u8)
+                        // do not use automatic end mode as a slave
+                        .autoend().clear_bit()
+                });
+
+                // Clear address acknowledge bit to signal peripheral to begin transfer
+                self.i2c.icr.write(|w| w.addrcf().set_bit());
+
+                for byte in bytes {
+                    // Wait until we have received something
+                    busy_wait!(self.i2c, rxne, bit_is_set);
+
+                    *byte = self.i2c.rxdr.read().rxdata().bits();
+                }
+
+                // end of transaction is marked by a STOP from master
+                loop {
+                    let isr = self.i2c.isr.read();
+                    if isr.stopf().bit_is_set() {
+                        // Expected case: a stop condition is set, we're done.
+                        self.i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
+                        break;
+                    } else if isr.rxne().bit_is_set() {
+                        // Error, transmitter is sending too much data                        
+                        return Err(Error::Nack);
+                    } else if isr.timeout().bit_is_set() {
+                        self.i2c.icr.write(|w| w.timoutcf().set_bit());
+                        return Err(Error::Timeout);
+                    } else if isr.berr().bit_is_set() {
+                        self.i2c.icr.write(|w| w.berrcf().set_bit());
+                        return Err(Error::BusError);
+                    } else if isr.arlo().bit_is_set() {
+                        self.i2c.icr.write(|w| w.arlocf().set_bit());
+                        return Err(Error::ArbitrationLost);
+                    } else {
+                        // try again
+                    }
+                }
 
                 Ok(())
             }
