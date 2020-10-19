@@ -276,6 +276,10 @@ macro_rules! i2c {
                         .bit(!config.analog_filter)
                 });
 
+                while !i2c.cr1.read().pe().bit_is_set() {
+                    asm::nop();
+                } // wait for enabled
+
                 I2c { i2c, sda, scl, _mode: PhantomData }
             }
         }
@@ -334,13 +338,6 @@ macro_rules! i2c {
                     asm::nop();
                 } // wait for disabled
 
-                // Enable clock stretch with slave byte control
-                i2c.cr1
-                    .modify(|_, w| w.nostretch().clear_bit().sbc().set_bit());
-
-                // Re-enable bus
-                i2c.cr1.modify(|_, w| w.pe().set_bit());
-
                 // Set up slave mode: set own address
                 // In 7-bit addressing mode for I2C, the low bit of the address
                 // must not be set and the upper 7 bits of the u8 are used.
@@ -356,9 +353,26 @@ macro_rules! i2c {
                         .set_bit()
                 });
 
-                // Enable interrupts
+                // Enable ACK generation of slave addresses
+                i2c.cr2.modify(|_, w| {
+                    w.nack().set_bit()
+                });
+
+                // Enable clock stretch with slave byte control
                 i2c.cr1.modify(|_, w| {
-                    w.addrie()
+                    w
+                        .gcen().set_bit()
+                        .nostretch().clear_bit()
+                        .sbc().set_bit()
+                        .pecen().clear_bit() // not using PEC
+                });
+
+                // Re-enable bus and interrupts
+                i2c.cr1.modify(|_, w| {
+                    w
+                        .pe()
+                        .set_bit()
+                        .addrie()
                         .set_bit()
                         .errie()
                         .set_bit()
@@ -544,12 +558,14 @@ macro_rules! i2c {
 
                 self.i2c.cr2.modify(|_, w| unsafe {
                     w
-                        // Start transfer
-                        .start().set_bit()
+                        // Start transfer - in slave mode this bit must be clear
+                        .start().clear_bit()
                         // Set number of bytes to transfer
                         .nbytes().bits(bytes.len() as u8)
                         // do not use automatic end mode as a slave
                         .autoend().clear_bit()
+                        // enable address acknowledge
+                        .nack().clear_bit()
                 });
 
                 // Clear address acknowledge bit to signal peripheral to begin transfer
@@ -569,10 +585,15 @@ macro_rules! i2c {
                 // so it remains up to us to check for NACK.
                 loop {
                     let isr = self.i2c.isr.read();
-                    if isr.nackf().bit_is_set() || isr.stopf().bit_is_set() {
+                    if isr.nackf().bit_is_set() {
+                        // Expected at end of transaction
+                        self.i2c.icr.write(|w| w.nackcf().set_bit());
+                    } else if isr.stopf().bit_is_set() {
                         // Expected case: a stop condition is set, we're done
                         self.i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
+                        busy_wait!(self.i2c, stopf, bit_is_clear);
                         flush_txdr!(self.i2c); // Ensure flushed
+                        self.i2c.cr2.write(|w| w.nack().set_bit());
                         break;
                     } else if isr.timeout().bit_is_set() {
                         self.i2c.icr.write(|w| w.timoutcf().set_bit());
@@ -585,8 +606,19 @@ macro_rules! i2c {
                         return Err(Error::ArbitrationLost);
                     } else {
                         // try again
+                        asm::nop()
                     }
                 }
+
+                // Clear errors at end of known successful transaction
+                self.i2c.icr.write(|w| {
+                    w
+                        .arlocf().set_bit()
+                        .berrcf().set_bit()
+                        .nackcf().set_bit()
+                        .ovrcf().set_bit()
+                        .timoutcf().set_bit()
+                });
 
                 Ok(())
             }
@@ -618,12 +650,14 @@ macro_rules! i2c {
                 // is BUSY or I2C is in slave mode.
                 self.i2c.cr2.modify(|_, w| unsafe {
                     w
-                        // Start transfer
-                        .start().set_bit()
+                        // Start transfer - in slave mode this bit must not be set
+                        .start().clear_bit()
                         // Set number of bytes to transfer
                         .nbytes().bits(bytes.len() as u8)
                         // do not use automatic end mode as a slave
                         .autoend().clear_bit()
+                        // enable address acknowledge
+                        .nack().clear_bit()
                 });
 
                 // Clear address acknowledge bit to signal peripheral to begin transfer
@@ -641,10 +675,12 @@ macro_rules! i2c {
                     let isr = self.i2c.isr.read();
                     if isr.stopf().bit_is_set() {
                         // Expected case: a stop condition is set, we're done.
-                        self.i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
+                        // Clear the stop bit, stop ack'ing data
+                        self.i2c.icr.write(|w| w.stopcf().set_bit());
+                        self.i2c.cr2.write(|w| w.nack().set_bit());
                         break;
                     } else if isr.rxne().bit_is_set() {
-                        // Error, transmitter is sending too much data                        
+                        // Error, transmitter is sending too much data
                         return Err(Error::Nack);
                     } else if isr.timeout().bit_is_set() {
                         self.i2c.icr.write(|w| w.timoutcf().set_bit());
@@ -657,6 +693,7 @@ macro_rules! i2c {
                         return Err(Error::ArbitrationLost);
                     } else {
                         // try again
+                        asm::nop()
                     }
                 }
 
