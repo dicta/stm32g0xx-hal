@@ -9,6 +9,7 @@ use crate::time::Hertz;
 use core::cmp;
 use core::marker::PhantomData;
 use cortex_m::asm;
+use rtt_target::rprintln;
 
 pub struct Config {
     speed: Option<Hertz>,
@@ -355,7 +356,7 @@ macro_rules! i2c {
 
                 // Enable ACK generation of slave addresses
                 i2c.cr2.modify(|_, w| {
-                    w.nack().set_bit()
+                    w.nack().clear_bit()
                 });
 
                 // Enable clock stretch with slave byte control
@@ -564,6 +565,8 @@ macro_rules! i2c {
                         .nbytes().bits(bytes.len() as u8)
                         // do not use automatic end mode as a slave
                         .autoend().clear_bit()
+                        // do not use reload mode when transmitting
+                        .reload().clear_bit()
                         // enable address acknowledge
                         .nack().clear_bit()
                 });
@@ -645,9 +648,7 @@ macro_rules! i2c {
                 // This could be up to 50% of a bus cycle (ie. up to 0.5/freq)
                 while self.i2c.cr2.read().start().bit_is_set() {};
 
-                // Set START and prepare to receive bytes into `buffer`.
-                // The START bit can be set even if the bus
-                // is BUSY or I2C is in slave mode.
+                // Prepare to receive bytes into `buffer`.
                 self.i2c.cr2.modify(|_, w| unsafe {
                     w
                         // Start transfer - in slave mode this bit must not be set
@@ -656,6 +657,8 @@ macro_rules! i2c {
                         .nbytes().bits(bytes.len() as u8)
                         // do not use automatic end mode as a slave
                         .autoend().clear_bit()
+                        // do use reload mode when receiving, for byte acking
+                        .reload().set_bit()
                         // enable address acknowledge
                         .nack().clear_bit()
                 });
@@ -670,34 +673,64 @@ macro_rules! i2c {
                     *byte = self.i2c.rxdr.read().rxdata().bits();
                 }
 
-                // end of transaction is marked by a STOP from master
+                // User is responsible for
+                // inspecting bytes and NACKing (and waiting for NACK clear by hw) if required
+                // Followed by waiting for stop condition ending transfer.
+
+                Ok(())
+            }
+        }
+
+        // Additional utility functions only used when I2C bus is in slave mode
+        impl<SDA, SCL> I2c<$I2CX, SDA, SCL, BusSlave> {
+
+            // Sends an ACK signal at the end of a successful read transfer
+            // and finishes the transfer.
+            //
+            // This functionality is separate from the basic Read trait
+            // implementation so that in I2C modes (e.g, SMBUS and other
+            // protocols) that want to be able to ACK/NACK the data received
+            // can now use the return value from i2c.read() and decide what
+            // to do about it.
+            pub fn end_read_transaction(&mut self) -> Result<(), Error> {
+
+                // Nonzero nbytes value to send configured ACK or NACK
+                self.i2c.cr2.modify(|_, w| unsafe {
+                    w.nbytes().bits(1)
+                });
+
+                // Wait for NACK to happen if it needs to
+                while self.i2c.cr2.read().nack().bit_is_set() {}
+
+                // Looking for STOP to signal end of transfer
                 loop {
                     let isr = self.i2c.isr.read();
                     if isr.stopf().bit_is_set() {
                         // Expected case: a stop condition is set, we're done.
-                        // Clear the stop bit, stop ack'ing data
+                        // Clear the stop bit
                         self.i2c.icr.write(|w| w.stopcf().set_bit());
-                        self.i2c.cr2.write(|w| w.nack().set_bit());
-                        break;
+                        return Ok(());
                     } else if isr.rxne().bit_is_set() {
                         // Error, transmitter is sending too much data
+                        rprintln!("Error waiting for stop: rxne");
                         return Err(Error::Nack);
                     } else if isr.timeout().bit_is_set() {
                         self.i2c.icr.write(|w| w.timoutcf().set_bit());
+                        rprintln!("Error waiting for stop: Timeout");
                         return Err(Error::Timeout);
                     } else if isr.berr().bit_is_set() {
                         self.i2c.icr.write(|w| w.berrcf().set_bit());
+                        rprintln!("Error waiting for stop: BusError");
                         return Err(Error::BusError);
                     } else if isr.arlo().bit_is_set() {
                         self.i2c.icr.write(|w| w.arlocf().set_bit());
+                        rprintln!("Error waiting for stop: ArbitrationLost");
                         return Err(Error::ArbitrationLost);
                     } else {
                         // try again
                         asm::nop()
                     }
                 }
-
-                Ok(())
             }
         }
     };
