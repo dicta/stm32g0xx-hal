@@ -4,6 +4,7 @@ use hal::blocking::i2c::{Read, Write, WriteRead};
 use crate::gpio::{gpioa::*, gpiob::*};
 use crate::gpio::{AltFunction, OpenDrain, Output};
 use crate::rcc::Rcc;
+use crate::stm32;
 use crate::stm32::{I2C1, I2C2};
 use crate::time::Hertz;
 use core::cmp;
@@ -155,6 +156,17 @@ macro_rules! flush_txdr {
         // If TXDR is not flagged as empty, write 1 to flush it
         if $i2c.isr.read().txe().bit_is_clear() {
             $i2c.isr.write(|w| w.txe().set_bit());
+        }
+    };
+}
+
+// Sequence to flush the RXDR register.
+macro_rules! flush_rxdr {
+    ($i2c:expr) => {
+        // RXNE=1 meaning that the previous received data byte has not yet been read
+        // the SCL line is stretched low until I2C_RXDR is read
+        if $i2c.isr.read().rxne().bit_is_set() {
+            let _ = $i2c.rxdr.read();
         }
     };
 }
@@ -683,6 +695,53 @@ macro_rules! i2c {
 
         // Additional utility functions only used when I2C bus is in slave mode
         impl<SDA, SCL> I2c<$I2CX, SDA, SCL, BusSlave> {
+
+            pub fn handle_slave_error(&mut self) {
+                // Prepare to NACK the current xfer
+                self.i2c.cr2.modify(|_, w| w.nack().set_bit());
+
+                // Clear the address match,
+                // otherwise no HAL read or write occurs to clear this
+                if self.i2c.isr.read().addr().bit_is_set() {
+                    self.i2c.icr.write(|w| w.addrcf().set_bit());
+                }
+
+                // Flush the transmit data register
+                flush_txdr!(self.i2c);
+
+                // Flush the receive data register
+                flush_rxdr!(self.i2c);
+            }
+
+            pub fn status(&mut self)
+            -> Result<stm32g0::R<u32, stm32g0::Reg<u32, stm32::i2c1::_ISR>>, Error> {
+                let isr = self.i2c.isr.read();
+
+                // Not an error condition:
+                // All transactions begin with a START and are terminated by a STOP
+                if isr.stopf().bit_is_set() {
+                    // Clear interrupt
+                    self.i2c.icr.write(|w| w.stopcf().set_bit());
+                }
+
+                // Detect error states, otherwise return the contents
+                // of the status register
+                if isr.berr().bit_is_set() {
+                    self.i2c.icr.write(|w| w.berrcf().set_bit());
+                    Err(Error::BusError)
+                } else if isr.arlo().bit_is_set() {
+                    self.i2c.icr.write(|w| w.arlocf().set_bit());
+                    Err(Error::ArbitrationLost)
+                } else if isr.nackf().bit_is_set() {
+                    self.i2c.icr.write(|w| w.nackcf().set_bit());
+                    Err(Error::Nack)
+                } else if isr.ovr().bit_is_set() {
+                    self.i2c.icr.write(|w| w.ovrcf().set_bit());
+                    Err(Error::Overrun)
+                } else {
+                    Ok(isr)
+                }
+            }
 
             // Sends an ACK signal at the end of a successful read transfer
             // and finishes the transfer.
