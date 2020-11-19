@@ -153,7 +153,7 @@ macro_rules! flush_txdr {
         }
 
         // If TXDR is not flagged as empty, write 1 to flush it
-        if $i2c.isr.read().txe().bit_is_set() {
+        if $i2c.isr.read().txe().bit_is_clear() {
             $i2c.isr.write(|w| w.txe().set_bit());
         }
     };
