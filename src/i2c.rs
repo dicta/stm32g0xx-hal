@@ -276,8 +276,36 @@ macro_rules! i2c {
                 i2c.cr1.modify(|_, w| w.pe().clear_bit());
 
                 // Setup protocol timings
-                let timing_bits = config.timing_bits(rcc.clocks.apb_clk);
+                let i2c_clk = rcc.clocks.apb_clk;
+                let timing_bits = config.timing_bits(i2c_clk);
                 i2c.timingr.write(|w| unsafe { w.bits(timing_bits) });
+
+                // Setup timeout values (SMBus compatible)
+                // Note: This leaves the timeouts disabled, but we need the I2C
+                // peripheral's clock frequency to set these up.
+
+                // each bit is 4 I2C clock cycles.
+                // Equation: 4 * (1/i2c_clk_hz) * (timeout_bits + 1) = timeout_sec
+                // 50us for bus idle detection is specified by SMBus 2.0
+                let timeouta_us = 50;
+                let timeouta_bits = (i2c_clk.0 * timeouta_us / 1000 / 1000 / 4) - 1;
+                // 25ms for SCL held low timeout is specified by SMBus 2.0
+                let timeoutb_ms = 25;
+                let timeoutb_bits = (i2c_clk.0 * timeoutb_ms / 1000 / 4) - 1;
+
+                i2c.timeoutr.modify(|_, w| unsafe {
+                    w
+                        // TIMEOUTA is used to detect both
+                        // SCL and SDA high timeout (bus idle condition)
+                        .timeouta().bits(timeouta_bits as u16)
+                        // TIMEOUTB is used to detect SCL being held low
+                        // (clock stretched) for longer than is permitted
+                        .timeoutb().bits(timeoutb_bits as u16)
+                        // Leave all timeouts disabled
+                        .tidle().clear_bit()
+                        .timouten().clear_bit()
+                        .texten().clear_bit()
+                });
 
                 // Enable the I2C processing
                 i2c.cr1.modify(|_, w| unsafe {
@@ -299,6 +327,7 @@ macro_rules! i2c {
 
         impl<SDA, SCL, Mode> I2c<$I2CX, SDA, SCL, Mode> {
             pub fn into_master(self) -> I2c<$I2CX, SDA, SCL, BusMaster> {
+
                 let (i2c, sda, scl) = self.release();
 
                 // Reset the bus, bringing it up in master mode
@@ -338,7 +367,13 @@ macro_rules! i2c {
                 // Re-enable bus
                 i2c.cr1.modify(|_, w| w.pe().set_bit());
 
-                I2c { i2c, sda, scl, _mode: PhantomData }
+                let mut periph = I2c { i2c, sda, scl, _mode: PhantomData };
+
+                // Disable timeout for clock stretch / lockup detection
+                // if it was previously set
+                periph.disable_scl_timeout();
+
+                return periph;
             }
 
             pub fn into_slave(self, addr: u8) -> I2c<$I2CX, SDA, SCL, BusSlave> {
@@ -391,11 +426,39 @@ macro_rules! i2c {
                         .set_bit()
                 });
 
-                I2c { i2c, sda, scl, _mode: PhantomData }
+                let mut periph = I2c { i2c, sda, scl, _mode: PhantomData };
+
+                // Enable timeout for clock stretch / lockup detection
+                periph.enable_scl_timeout();
+
+                return periph;
             }
 
             pub fn release(self) -> ($I2CX, SDA, SCL) {
                 (self.i2c, self.sda, self.scl)
+            }
+
+            pub fn enable_scl_timeout(&mut self) {
+                self.i2c.timeoutr.modify(|_, w| {
+                    w
+                        // Detect SCL being held low (clock stretched) for
+                        // longer than is permitted in a single transaction
+                        .texten().set_bit()
+                        // Bus lockup detection (SCL held low continuously)
+                        .timouten().set_bit()
+                });
+
+                // Clear timeout status
+                self.i2c.icr.write(|w| w.timoutcf().set_bit());
+            }
+
+            pub fn disable_scl_timeout(&mut self) {
+                self.i2c.timeoutr.modify(|_, w| {
+                    w.texten().clear_bit().timouten().clear_bit()
+                });
+
+                // Clear timeout status
+                self.i2c.icr.write(|w| w.timoutcf().set_bit());
             }
         }
 
