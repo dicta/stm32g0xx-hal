@@ -83,16 +83,36 @@ impl Adc {
         self.precision = precision;
     }
 
-    fn power_up(&mut self) {
+    pub fn power_up(&mut self) {
         self.rb.isr.modify(|_, w| w.adrdy().set_bit());
         self.rb.cr.modify(|_, w| w.aden().set_bit());
         while self.rb.isr.read().adrdy().bit_is_clear() {}
     }
 
-    fn power_down(&mut self) {
+    pub fn power_down(&mut self) {
         self.rb.cr.modify(|_, w| w.addis().set_bit());
         self.rb.isr.modify(|_, w| w.adrdy().set_bit());
         while self.rb.cr.read().aden().bit_is_set() {}
+    }
+
+    /// Returns whether this ADC is currently powered up
+    pub fn is_powered_up(&mut self) -> bool {
+        self.rb.cr.read().aden().bit_is_set()
+    }
+
+    /// Runs the calibration routine on the ADC.
+    ///
+    /// Calibration must be performed with the ADC peripheral
+    /// powered down, so this call will power down the ADC if
+    /// necessary before running calibration.
+    pub fn calibrate(&mut self) {
+        if self.is_powered_up() {
+            self.power_down();
+        }
+
+        self.rb.cr.write(|w| w.adcal().set_bit());
+        // Wait for hardware to report complete
+        while self.rb.cr.read().adcal().bit_is_set() {}
     }
 
     pub fn release(self) -> ADC {
@@ -118,7 +138,12 @@ where
     type Error = ();
 
     fn read(&mut self, _pin: &mut PIN) -> nb::Result<WORD, Self::Error> {
-        self.power_up();
+        let powered_up = self.is_powered_up();
+        if !powered_up {
+            self.calibrate();
+            self.power_up();
+        }
+
         self.rb.cfgr1.modify(|_, w| unsafe {
             w.res()
                 .bits(self.precision as u8)
@@ -145,7 +170,9 @@ where
             res
         };
 
-        self.power_down();
+        if !powered_up {
+            self.power_down();
+        }
         Ok(val.into())
     }
 }
