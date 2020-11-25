@@ -55,6 +55,36 @@ impl Default for Clocks {
     }
 }
 
+/// Possible causes of the last system reset
+#[derive(Clone, Copy)]
+pub enum ResetCause {
+    LowPower,
+    WindowWatchdog,
+    IndependentWatchdog,
+    SoftwareReset,
+    PowerOnReset,
+    ExternalPin,
+
+    /// For the STM32G0xx, there's only one flag to signal that
+    /// either a brownout or a power off/on reset occurred. We
+    /// report all of these as the "PowerOnReset" type and don't
+    /// use this enumeration value for this particular part.
+    Brownout,
+
+    /// Changes in option bytes can require a reset after flashing
+    /// the device is complete. This is a separate reset type
+    /// triggered by the OBL_LAUNCH bit in the FLASH CR.
+    OptionByteLoader,
+
+    /// We saw multiple reset flags at the same time. This should
+    /// never occur, so we specifically keep track of this state.
+    InvalidMultipleCauses,
+
+    /// No reset flags were set. This shouldn't happen unless
+    /// the register was cleared after the last reset.
+    Unknown,
+}
+
 /// Reset pin mode and remap
 pub enum ResetMode {
     /// Reset Input only: a low level on the NRST pin generates system reset, internal RESET not propagated to the NSRT pin
@@ -172,6 +202,66 @@ impl Rcc {
                 apb_tim_clk: apb_tim_freq.hz(),
             },
         }
+    }
+
+    /// Returns the cause of the last system reset reported by
+    /// the RCC peripheral's status registers.
+    ///
+    /// After reading the reset cause, all related register flags
+    /// will be cleared. Otherwise, after a series of resets,
+    /// all flags would persist and it would be impossible to
+    /// determine the cause of the most recent reset.
+    pub fn reset_cause(&mut self) -> ResetCause {
+
+        let mut cause = ResetCause::Unknown;
+        let mut num_cause_flags = 0;
+
+        let csr = self.rb.csr.read();
+
+        if csr.lpwrrstf().bit_is_set() {
+            cause = ResetCause::LowPower;
+            num_cause_flags += 1;
+        }
+
+        if csr.wwdgrstf().bit_is_set() {
+            cause = ResetCause::WindowWatchdog;
+            num_cause_flags += 1;
+        }
+
+        if csr.iwdgrstf().bit_is_set() {
+            cause = ResetCause::IndependentWatchdog;
+            num_cause_flags += 1;
+        }
+
+        if csr.sftrstf().bit_is_set() {
+            cause = ResetCause::SoftwareReset;
+            num_cause_flags += 1;
+        }
+
+        if csr.pinrstf().bit_is_set() {
+            cause = ResetCause::ExternalPin;
+            num_cause_flags += 1;
+        }
+
+        if csr.oblrstf().bit_is_set() {
+            cause = ResetCause::OptionByteLoader;
+            num_cause_flags += 1;
+        }
+
+
+        if csr.pwrrstf().bit_is_set() {
+            cause = ResetCause::PowerOnReset;
+            num_cause_flags += 1;
+        }
+
+        if num_cause_flags > 1 {
+            cause = ResetCause::InvalidMultipleCauses;
+        }
+
+        // Clear all of the reset flags in this register
+        self.rb.csr.write(|w| w.rmvf().set_bit());
+
+        cause
     }
 
     pub fn set_reset_mode(&mut self, mode: ResetMode) {
